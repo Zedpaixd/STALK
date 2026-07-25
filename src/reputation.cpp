@@ -36,17 +36,14 @@ std::string Reputation::key(std::uint8_t kind, const std::string &hash) const {
 }
 
 bool Reputation::set_immutable(bool on) const {
-    int fd = ::open(path_.c_str(), O_RDONLY);
+    int fd = ::open(path_.c_str(), O_RDONLY | O_NONBLOCK);
     if (fd < 0) return false;
     int attr = 0;
     bool ok = false;
     if (ioctl(fd, FS_IOC_GETFLAGS, &attr) == 0) {
         int want = on ? (attr | FS_IMMUTABLE_FL) : (attr & ~FS_IMMUTABLE_FL);
-        if (want != attr) {
-            ok = (ioctl(fd, FS_IOC_SETFLAGS, &want) == 0);
-        } else {
-            ok = true;
-        }
+        if (want == attr) ok = true;
+        else ok = (ioctl(fd, FS_IOC_SETFLAGS, &want) == 0);
     }
     ::close(fd);
     return ok;
@@ -77,6 +74,7 @@ std::string Reputation::resolve_exe(std::uint32_t pid) const {
 
 std::string Reputation::hash_of_pid(std::uint32_t pid, bool &ok) {
     ok = false;
+    if (pid == 0) return std::string();
     char link[64];
     std::snprintf(link, sizeof(link), "/proc/%u/exe", pid);
     return Sha256::file_hex(link, ok);
@@ -97,10 +95,7 @@ void Reputation::load() {
         int fd = ::open(path_.c_str(), O_RDONLY);
         if (fd >= 0) {
             int attr = 0;
-            if (ioctl(fd, FS_IOC_GETFLAGS, &attr) == 0) {
-                int test = attr & ~FS_IMMUTABLE_FL;
-                immutable_supported_ = (ioctl(fd, FS_IOC_SETFLAGS, &test) == 0);
-            }
+            immutable_supported_ = (ioctl(fd, FS_IOC_GETFLAGS, &attr) == 0);
             ::close(fd);
         }
     }
@@ -133,8 +128,7 @@ void Reputation::load() {
 
 bool Reputation::save() {
     std::lock_guard<std::mutex> lk(mtx_);
-    bool was_immutable = set_immutable(false);
-    (void)was_immutable;
+    bool cleared = set_immutable(false);
 
     json j;
     j["version"] = 1;
@@ -156,6 +150,7 @@ bool Reputation::save() {
 
     std::string tmp = path_ + ".tmp";
     bool wrote = false;
+    std::string why;
 
     {
         std::ofstream ofs(tmp, std::ios::trunc);
@@ -166,8 +161,14 @@ bool Reputation::save() {
                 ofs.close();
                 ::chmod(tmp.c_str(), 0600);
                 if (::rename(tmp.c_str(), path_.c_str()) == 0) wrote = true;
-                else ::unlink(tmp.c_str());
+                else { why = std::string("rename: ") + std::strerror(errno); ::unlink(tmp.c_str()); }
+            } else {
+                why = "tmp write failed";
+                ofs.close();
+                ::unlink(tmp.c_str());
             }
+        } else {
+            why = std::string("tmp open: ") + std::strerror(errno);
         }
     }
 
@@ -177,11 +178,19 @@ bool Reputation::save() {
             ofs << dumped;
             ofs.flush();
             wrote = (bool)ofs;
+            if (!wrote) why += " | direct write failed";
+        } else {
+            why += std::string(" | direct open: ") + std::strerror(errno);
         }
     }
 
+    if (!wrote) {
+        std::fprintf(stderr, "[REP-SAVE-FAIL] path=%s cleared_immutable=%d reason=%s\n",
+                     path_.c_str(), (int)cleared, why.c_str());
+    }
+
     ::chmod(path_.c_str(), 0600);
-    set_immutable(true);
+    if (wrote && cleared) set_immutable(true);
     return wrote;
 }
 
@@ -199,7 +208,11 @@ bool Reputation::is_whitelisted(const std::string &hash) const {
 
 bool Reputation::add(std::uint8_t kind, const std::string &hash,
                      const std::string &name, const std::string &path) {
-    if (hash.empty()) return false;
+    if (hash.empty()) {
+        std::fprintf(stderr, "[REP-ADD-REJECT] empty hash (name='%s' path='%s')\n",
+                     name.c_str(), path.c_str());
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lk(mtx_);
         RepEntry e;
@@ -208,7 +221,10 @@ bool Reputation::add(std::uint8_t kind, const std::string &hash,
         e.kind = kind; e.paused = false;
         entries_[key(kind, hash)] = e;
     }
-    return save();
+    bool ok = save();
+    std::fprintf(stderr, "[REP-ADD] kind=%d hash=%.12s name='%s' saved=%d\n",
+                 (int)kind, hash.c_str(), name.c_str(), (int)ok);
+    return ok;
 }
 
 bool Reputation::remove(const std::string &hash, std::uint8_t kind) {

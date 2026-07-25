@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <memory>
 #include <signal.h>
 #include <string>
@@ -110,7 +111,6 @@ int main(int argc, char **argv) {
     const char *cfg_path = (argc > 1) ? argv[1] : "rules.json";
     auto cfg_opt = MathEng::load(cfg_path);
     if (!cfg_opt) { std::fprintf(stderr, "failed to load %s\n", cfg_path); return 1; }
-
     Keymap km;
     std::string km_note;
     km.load("binds.json", km_note);
@@ -138,25 +138,21 @@ int main(int argc, char **argv) {
             }
         }
     }
-
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
     libbpf_set_print(libbpf_verbose);
     bump_rlim();
-
     auto rep = std::make_shared<Reputation>(cfg_opt->reputation_path);
     rep->load();
-
     std::uint32_t opgid = static_cast<std::uint32_t>(getpgid(0));
     std::uint32_t opid  = static_cast<std::uint32_t>(getpid());
+    std::fprintf(stderr, "[SELF] pid=%u pgid=%u\n", opid, opgid);
     auto tr = std::make_shared<Tracker>(*cfg_opt, opgid, opid, rep);
     g_tr = tr.get();
-
     auto sup = std::make_shared<SeccompSupervisor>();
     sup->attach_tracker(tr.get());
-
     if (rep->tamper_flagged())
         tr->push_alert("[REP] WARNING reputation store checksum mismatch - possible tampering");
     {
@@ -166,15 +162,20 @@ int main(int argc, char **argv) {
         tr->push_alert(m);
     }
     tr->push_alert(std::string("[keys] ") + km_note);
-
     if (access("/sys/kernel/tracing/events/sched/sched_process_fork/id", F_OK) != 0) {
         std::fprintf(stderr, "tracefs not mounted. run: sudo mount -t tracefs nodev /sys/kernel/tracing\n");
         return 1;
     }
-
+    struct stat pns;
+    if (::stat("/proc/self/ns/pid", &pns) != 0) {
+        std::fprintf(stderr, "cannot stat /proc/self/ns/pid (errno=%d %s)\n",
+                     errno, std::strerror(errno));
+        return 1;
+    }
+    std::fprintf(stderr, "[SELF] pidns dev=%llu ino=%llu\n",
+                 (unsigned long long)pns.st_dev, (unsigned long long)pns.st_ino);
     struct edr_bpf *sk = edr_bpf__open();
     if (!sk) { std::fprintf(stderr, "skel open fail\n"); return 1; }
-
     auto fp = [](double d) -> std::uint32_t { return (std::uint32_t)(d * (double)BURST_FP_SCALE); };
     sk->rodata->deny_exec         = cfg_opt->deny_exec ? 1 : 0;
     sk->rodata->deny_wx           = cfg_opt->deny_wx ? 1 : 0;
@@ -184,6 +185,8 @@ int main(int argc, char **argv) {
     sk->rodata->block_descendants = cfg_opt->block_descendants ? 1 : 0;
     sk->rodata->emit_deny_events  = cfg_opt->emit_deny_events ? 1 : 0;
     sk->rodata->self_tgid         = opid;
+    sk->rodata->pidns_dev         = (std::uint64_t)pns.st_dev;
+    sk->rodata->pidns_ino         = (std::uint64_t)pns.st_ino;
     sk->rodata->burst_enabled     = cfg_opt->burst_enabled ? 1 : 0;
     sk->rodata->burst_ceiling_fp  = (std::uint64_t)(cfg_opt->burst_ceiling * (double)BURST_FP_SCALE);
     sk->rodata->bw_memfd          = fp(cfg_opt->bw_memfd);
@@ -195,7 +198,6 @@ int main(int argc, char **argv) {
     sk->rodata->bw_secbpf         = fp(cfg_opt->bw_secbpf);
     sk->rodata->bw_connect        = fp(cfg_opt->bw_connect);
     sk->rodata->bw_exec           = fp(cfg_opt->bw_exec);
-
     if (edr_bpf__load(sk)) {
         std::fprintf(stderr, "skel load fail (errno=%d %s)\n", errno, std::strerror(errno));
         edr_bpf__destroy(sk);
@@ -219,15 +221,12 @@ int main(int argc, char **argv) {
     try_attach(sk->progs.lsm_setuid, tr.get(), "lsm/task_fix_setuid");
     try_attach(sk->progs.lsm_ptrace, tr.get(), "lsm/ptrace_access_check");
     try_attach(sk->progs.lsm_connect, tr.get(), "lsm/socket_connect");
-
     tr->set_enforcement_fds(bpf_map__fd(sk->maps.blocked_tgids), bpf_map__fd(sk->maps.enforce_on));
     tr->set_burst_fds(bpf_map__fd(sk->maps.burst_epoch), bpf_map__fd(sk->maps.exempt_tgids));
     tr->set_enforcement(cfg_opt->enforce_enabled);
     tr->seed_from_proc();
-
     struct ring_buffer *rb = ring_buffer__new(bpf_map__fd(sk->maps.rb), rb_cb, tr.get(), nullptr);
     if (!rb) { std::fprintf(stderr, "ringbuf init failed\n"); edr_bpf__destroy(sk); return 1; }
-
     std::thread poller([&]() {
         while (g_run.load() && tr->running()) {
             int r = ring_buffer__poll(rb, 100);
@@ -239,10 +238,8 @@ int main(int argc, char **argv) {
         auto ms = std::chrono::milliseconds(cfg_opt->tick_ms);
         while (g_run.load() && tr->running()) { tr->tick(); std::this_thread::sleep_for(ms); }
     });
-
     Ui ui(tr, sup, km);
     ui.run();
-
     g_run.store(false);
     tr->stop();
     sup->stop();

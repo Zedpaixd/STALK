@@ -79,6 +79,8 @@ volatile const __u8  deny_connect      = 1;
 volatile const __u8  block_descendants = 1;
 volatile const __u8  emit_deny_events  = 1;
 volatile const __u32 self_tgid         = 0;
+volatile const __u64 pidns_dev = 0;
+volatile const __u64 pidns_ino = 0;
 
 volatile const __u8  burst_enabled     = 1;
 volatile const __u64 burst_ceiling_fp  = 983040;
@@ -113,9 +115,32 @@ static __always_inline __u32 rd_ppid(struct task_struct *t) {
     return BPF_CORE_READ(t, real_parent, tgid);
 }
 
+static __always_inline int cur_ns_ids(__u32 *pid, __u32 *tgid) {
+    struct bpf_pidns_info ns = {};
+    if (bpf_get_ns_current_pid_tgid(pidns_dev, pidns_ino, &ns, sizeof(ns)) != 0)
+        return -1;
+    *pid = ns.pid;
+    *tgid = ns.tgid;
+    return 0;
+}
+
+static __always_inline __u32 ns_nr_of(struct pid *p) {
+    if (!p) return 0;
+    unsigned int lvl = BPF_CORE_READ(p, level);
+    if (lvl > 8) return 0;
+    struct upid up = {};
+    if (bpf_probe_read_kernel(&up, sizeof(up), &p->numbers[lvl]) != 0) return 0;
+    return up.nr;
+}
+
+static __always_inline __u32 ns_tgid_of(struct task_struct *t) {
+    if (!t) return 0;
+    return ns_nr_of(BPF_CORE_READ(t, signal, pids[PIDTYPE_TGID]));
+}
+
 static __always_inline int in_self_tree(void) {
-    __u64 pt = bpf_get_current_pid_tgid();
-    __u32 tgid = (__u32)(pt >> 32);
+    __u32 pid = 0, tgid = 0;
+    if (cur_ns_ids(&pid, &tgid) != 0) return 0;
     if (tgid == self_tgid) return 1;
     struct task_struct *t = bpf_get_current_task_btf();
     #pragma unroll
@@ -123,7 +148,7 @@ static __always_inline int in_self_tree(void) {
         if (!t) break;
         t = BPF_CORE_READ(t, real_parent);
         if (!t) break;
-        __u32 ptg = BPF_CORE_READ(t, tgid);
+        __u32 ptg = ns_tgid_of(t);
         if (ptg == 0 || ptg == 1) break;
         if (ptg == self_tgid) return 1;
     }
@@ -141,6 +166,19 @@ static __always_inline void fill_meta(struct edr_event *e) {
     e->uid = (__u32)bpf_get_current_uid_gid();
     e->ns_inum = rd_nsinum(t);
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    if (e->comm[0] == 'e' && e->comm[1] == 'd' && e->comm[2] == 'r' && e->comm[3] == 0) {
+        struct task_struct *rp = BPF_CORE_READ(t, real_parent);
+        __u32 rp_tgid = rp ? BPF_CORE_READ(rp, tgid) : 0;
+        char pcomm[16] = {};
+        if (rp) bpf_probe_read_kernel_str(pcomm, sizeof(pcomm), BPF_CORE_READ(rp, comm));
+        struct task_struct *gp = rp ? BPF_CORE_READ(rp, real_parent) : 0;
+        __u32 gp_tgid = gp ? BPF_CORE_READ(gp, tgid) : 0;
+        char gcomm[16] = {};
+        if (gp) bpf_probe_read_kernel_str(gcomm, sizeof(gcomm), BPF_CORE_READ(gp, comm));
+        bpf_printk("MP pid=%u tgid=%u self=%u", e->pid, e->tgid, self_tgid);
+        bpf_printk("MP par=%u '%s'", rp_tgid, pcomm);
+        bpf_printk("MP gpar=%u '%s'", gp_tgid, gcomm);
+    }
 }
 
 static __always_inline struct edr_event *ev_reserve(__u8 ty) {
@@ -205,6 +243,14 @@ int tp_fork(struct trace_event_raw_sched_process_fork *ctx) {
     e->uid = (__u32)bpf_get_current_uid_gid();
     e->ns_inum = rd_nsinum(t);
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    if (e->comm[0] == 'e' && e->comm[1] == 'd' && e->comm[2] == 'r' && e->comm[3] == 0) {
+        __u64 pt = bpf_get_current_pid_tgid();
+        bpf_printk("FORK cur_pid=%u cur_tgid=%u", (__u32)pt, (__u32)(pt >> 32));
+        bpf_printk("FORK ctx_parent=%u ctx_child=%u self=%u",
+                   ctx->parent_pid, ctx->child_pid, self_tgid);
+    }
+
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
@@ -388,9 +434,9 @@ static __always_inline int enforcement_live(void) {
 }
 
 static __always_inline int is_blocked(void) {
+    if (in_self_tree()) return 0;
     __u64 pt = bpf_get_current_pid_tgid();
     __u32 tgid = (__u32)(pt >> 32);
-    if (tgid == self_tgid) return 0;
     if (bpf_map_lookup_elem(&exempt_tgids, &tgid)) return 0;
     if (bpf_map_lookup_elem(&blocked_tgids, &tgid)) return 1;
     if (!block_descendants) return 0;
@@ -402,7 +448,6 @@ static __always_inline int is_blocked(void) {
         if (!t) break;
         __u32 ptg = BPF_CORE_READ(t, tgid);
         if (ptg == 0 || ptg == 1) break;
-        if (ptg == self_tgid) return 0;
         if (bpf_map_lookup_elem(&exempt_tgids, &ptg)) return 0;
         if (bpf_map_lookup_elem(&blocked_tgids, &ptg)) return 1;
     }

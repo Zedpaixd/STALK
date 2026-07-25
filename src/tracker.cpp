@@ -18,6 +18,8 @@ static constexpr double WATCH_THRESHOLD = 0.40;
 static constexpr std::size_t WATCH_MAX = 20;
 static constexpr std::size_t MASQ_CAP = 100;
 
+#define TLOG(...) do { std::fprintf(stderr, "[T] " __VA_ARGS__); std::fprintf(stderr, "\n"); } while (0)
+
 enum PromptAct { PA_NONE = 0, PA_RESUME, PA_FREEZE, PA_KILL, PA_WHITELIST };
 
 static const struct { const char *name; const char *desc; } PROMPT_ACTIONS[] = {
@@ -48,6 +50,25 @@ static std::string ev_action_desc(std::uint8_t t) {
         case EV_TCP_CONNECT: return "open an outbound connection (possible C2)";
     }
     return "perform a suspicious operation";
+}
+
+static const char *evname(std::uint8_t t) {
+    switch (t) {
+        case EV_FORK: return "FORK";
+        case EV_EXIT: return "EXIT";
+        case EV_EXEC: return "EXEC";
+        case EV_MPROTECT_WX: return "WX";
+        case EV_MEMFD_CREATE: return "MEMFD";
+        case EV_PRCTL_RENAME: return "RENAME";
+        case EV_PTRACE: return "PTRACE";
+        case EV_COMMIT_CREDS: return "CREDS";
+        case EV_UNSHARE: return "UNSHARE";
+        case EV_SEC_BPF: return "SECBPF";
+        case EV_TCP_CONNECT: return "CONNECT";
+        case EV_LSM_DENY: return "LSMDENY";
+        case EV_BURST_TRIP: return "BURST";
+    }
+    return "?";
 }
 
 static double now_sec() {
@@ -92,6 +113,9 @@ Tracker::Tracker(EngineCfg cfg, std::uint32_t own_pgid, std::uint32_t own_pid,
                               "sudo", "su", "login", "systemd", "init",
                               "init(kali-linux", "SessionLeader", "Relay" };
     }
+    TLOG("CTOR own_pid=%u own_pgid=%u prompt_enabled=%d prompt_thr=%.2f prompt_floor=%.2f warmup=%.1f",
+         own_pid_, own_pgid_, (int)cfg_.prompt_enabled, cfg_.prompt_threshold,
+         cfg_.prompt_event_floor, cfg_.warmup_sec);
 }
 
 double Tracker::warmup_remaining() const {
@@ -121,7 +145,28 @@ std::string Tracker::ev_key(std::uint8_t t) const {
 }
 
 bool Tracker::self_pid(std::uint32_t pid, std::uint32_t pgid) const {
-    return pid == own_pid_ || pgid == own_pgid_;
+    if (pid == own_pid_ || pgid == own_pgid_) return true;
+    if (pid == 0) return false;
+    std::uint32_t c = pid;
+    for (int i = 0; i < 16 && c > 1; i++) {
+        if (c == own_pid_) return true;
+        char sp[64];
+        std::snprintf(sp, sizeof(sp), "/proc/%u/stat", c);
+        int fd = ::open(sp, O_RDONLY);
+        if (fd < 0) break;
+        char b[256];
+        ssize_t bn = ::read(fd, b, sizeof(b) - 1);
+        ::close(fd);
+        if (bn <= 0) break;
+        b[bn] = 0;
+        char *rr = std::strrchr(b, ')');
+        if (!rr) break;
+        char st; unsigned pp = 0;
+        if (std::sscanf(rr + 1, " %c %u", &st, &pp) != 2) break;
+        if (pp == own_pid_) return true;
+        c = pp;
+    }
+    return false;
 }
 bool Tracker::is_self(const edr_event &e) const {
     return e.tgid == own_pid_ || self_pid(e.pid, e.pgid);
@@ -142,11 +187,16 @@ bool Tracker::is_masq_name(const char *nm) const {
 bool Tracker::node_is_supervised(const std::shared_ptr<ProcNode> &n) const {
     auto cur = n;
     int guard = 0;
+    int hops = 0;
     while (cur && guard++ < 256) {
         if (cur->supervised) return true;
         if (supervised_roots_.count(cur->tgid)) return true;
         cur = cur->parent.lock();
+        hops++;
     }
+    if (n && std::strncmp(n->comm, "edr", 3) == 0)
+        TLOG("SUPCHK tgid=%u comm='%.16s' -> NOT supervised (walked %d hops, roots=%zu)",
+             n->tgid, n->comm, hops, supervised_roots_.size());
     return false;
 }
 
@@ -158,6 +208,23 @@ void Tracker::kernel_exempt(std::uint32_t tgid, bool on) {
     } else {
         bpf_map_delete_elem(exempt_fd_, &tgid);
     }
+}
+
+void Tracker::remember_exec(std::uint32_t tgid, const std::string &path, const std::string &hash) {
+    if (tgid == 0) return;
+    static constexpr std::size_t REMEMBER_CAP = 8192;
+    if (!path.empty()) {
+        if (tgid_path_.size() >= REMEMBER_CAP && tgid_path_.find(tgid) == tgid_path_.end())
+            tgid_path_.clear();
+        tgid_path_[tgid] = path;
+    }
+    if (!hash.empty()) {
+        if (tgid_hash_.size() >= REMEMBER_CAP && tgid_hash_.find(tgid) == tgid_hash_.end())
+            tgid_hash_.clear();
+        tgid_hash_[tgid] = hash;
+    }
+    TLOG("REMEMBER tgid=%u path='%s' hash=%s",
+         tgid, path.empty() ? "(none)" : path.c_str(), hash.empty() ? "(none)" : "ok");
 }
 
 void Tracker::log_alert(const std::string &s) {
@@ -173,6 +240,7 @@ void Tracker::register_supervised(std::uint32_t tgid) {
     kernel_exempt(tgid, true);
     auto n = lookup_by_pid(tgid);
     if (n) { n->supervised = true; n->exempt = false; }
+    TLOG("REG-SUP tgid=%u node_found=%d roots_now=%zu", tgid, (int)(bool)n, supervised_roots_.size());
     char m[128];
     std::snprintf(m, sizeof(m), "[SECCOMP] now supervising pid=%u (eBPF muted for its tree; scoring only)", tgid);
     log_alert(m);
@@ -182,6 +250,7 @@ void Tracker::unregister_supervised(std::uint32_t tgid) {
     if (tgid == 0) return;
     std::unique_lock<std::shared_mutex> lk(g_lock_);
     supervised_roots_.erase(tgid);
+    TLOG("UNREG-SUP tgid=%u roots_now=%zu", tgid, supervised_roots_.size());
     char m[96];
     std::snprintf(m, sizeof(m), "[SECCOMP] supervision ended for pid=%u", tgid);
     log_alert(m);
@@ -228,6 +297,7 @@ RiskPrediction Tracker::predict_for_syscall(std::uint32_t tgid, int syscall_nr,
     auto n = lookup_by_pid(tgid);
     if (!n) {
         bool sup = supervised_roots_.count(tgid) > 0;
+        TLOG("PREDICT tgid=%u no node -> synth(sup=%d)", tgid, (int)sup);
         n = synth_node(tgid, sup);
         if (n) {
             char m[128];
@@ -238,6 +308,7 @@ RiskPrediction Tracker::predict_for_syscall(std::uint32_t tgid, int syscall_nr,
         }
     }
     if (!n) {
+        TLOG("PREDICT tgid=%u UNKNOWN (synth failed)", tgid);
         rp.known = false;
         return rp;
     }
@@ -247,6 +318,10 @@ RiskPrediction Tracker::predict_for_syscall(std::uint32_t tgid, int syscall_nr,
     double base = (evtype >= 0) ? MathEng::llr_for(cfg_, k) : 0.0;
     int cat = (evtype >= 0) ? ev_category((std::uint8_t)evtype) : -1;
     bool scores = (evtype >= 0 && base > 0.0);
+
+    TLOG("PREDICT tgid=%u comm='%.16s' nr=%d evtype=%d base=%.2f scores=%d sup=%d exempt=%d",
+         tgid, n->comm, syscall_nr, evtype, base, (int)scores,
+         (int)node_is_supervised(n), (int)n->exempt);
 
     auto predict_node = [&](const std::shared_ptr<ProcNode> &node) -> double {
         double sim[CAT_COUNT];
@@ -379,16 +454,26 @@ void Tracker::seccomp_persist_hash(std::uint32_t tgid, bool blacklist) {
             auto hit = tgid_hash_.find(tgid);
             if (hit != tgid_hash_.end()) hash = hit->second;
         }
+        if (path.empty()) {
+            auto pit = tgid_path_.find(tgid);
+            if (pit != tgid_path_.end()) path = pit->second;
+        }
+    }
+    TLOG("SEC-PERSIST tgid=%u node_hash=%d node_path=%d -> hash='%s' path='%s'",
+         tgid, (int)!hash.empty(), (int)!path.empty(),
+         hash.empty() ? "(none)" : "ok", path.empty() ? "(none)" : path.c_str());
+    if (hash.empty() && !path.empty()) {
+        bool ok = false;
+        hash = Reputation::hash_of_file(path, ok);
+        if (!ok) hash.clear();
+        TLOG("SEC-PERSIST hash_of_file('%s') -> %d", path.c_str(), (int)ok);
     }
     if (path.empty()) path = rep_->resolve_exe(tgid);
     if (hash.empty()) {
         bool ok = false;
         hash = Reputation::hash_of_pid(tgid, ok);
-        if (!ok) {
-            hash.clear();
-            if (!path.empty()) hash = Reputation::hash_of_file(path, ok);
-            if (!ok) hash.clear();
-        }
+        if (!ok) hash.clear();
+        TLOG("SEC-PERSIST hash_of_pid(%u) -> %d", tgid, (int)ok);
     }
     if (comm.empty() && !path.empty()) {
         std::size_t sl = path.find_last_of('/');
@@ -446,6 +531,7 @@ void Tracker::seed_from_proc() {
 
     std::unique_lock<std::shared_mutex> lk(g_lock_);
     double t = now_sec();
+    int seeded_edr = 0;
     for (auto &se : entries) {
         auto n = std::make_shared<ProcNode>();
         n->uid = std::to_string(se.pid) + "_seed";
@@ -457,6 +543,10 @@ void Tracker::seed_from_proc() {
         n->exempt = self_pid(se.pid, se.pgid) || is_exempt_comm(n->comm);
         if (n->exempt) kernel_exempt(se.pid, true);
         n->created_ts = t; n->last_ev_ts = t; n->last_score_ts = t;
+        if (std::strncmp(n->comm, "edr", 3) == 0) {
+            seeded_edr++;
+            TLOG("SEED edr node pid=%u ppid=%u pgid=%u exempt=%d", se.pid, se.ppid, se.pgid, (int)n->exempt);
+        }
         nodes_[n->uid] = n;
         pid_to_uid_[se.pid] = n->uid;
     }
@@ -474,6 +564,7 @@ void Tracker::seed_from_proc() {
         }
         roots_.push_back(n);
     }
+    TLOG("SEED done: %zu nodes, %d named edr, %zu roots", nodes_.size(), seeded_edr, roots_.size());
 }
 
 std::shared_ptr<ProcNode> Tracker::lookup_by_pid(std::uint32_t tgid) {
@@ -503,15 +594,25 @@ std::shared_ptr<ProcNode> Tracker::fork_node(const edr_event &e) {
     if (n->exempt) kernel_exempt(n->tgid, true);
     double t = ns_to_sec(e.ts_ns);
     n->created_ts = t; n->last_ev_ts = t; n->last_score_ts = t;
+    if (supervised_roots_.count(e.ppid) || supervised_roots_.count(e.tgid))
+        n->supervised = true;
     auto par = lookup_by_pid(e.ppid);
+    bool par_found = (bool)par;
+    bool synthed = false;
     if (par) {
         n->parent = par; par->children.push_back(n);
         if (par->supervised || supervised_roots_.count(par->tgid)) n->supervised = true;
     }
-    else roots_.push_back(n);
-    if (supervised_roots_.count(e.tgid)) n->supervised = true;
+    else {
+        auto sn = synth_node(e.ppid, supervised_roots_.count(e.ppid) > 0);
+        if (sn) { n->parent = sn; sn->children.push_back(n); if (sn->supervised) n->supervised = true; synthed = true; }
+        else roots_.push_back(n);
+    }
     nodes_[n->uid] = n;
     pid_to_uid_[e.tgid] = n->uid;
+    TLOG("FORK-NODE pid=%u tgid=%u ppid=%u pgid=%u comm='%.16s' exempt=%d sup=%d par=%d synth=%d root=%d",
+         e.pid, e.tgid, e.ppid, e.pgid, e.comm, (int)n->exempt, (int)n->supervised,
+         (int)par_found, (int)synthed, (int)(!par_found && !synthed));
     return n;
 }
 
@@ -520,17 +621,17 @@ std::shared_ptr<ProcNode> Tracker::synth_node(std::uint32_t tgid, bool supervise
     char path[64];
     std::snprintf(path, sizeof(path), "/proc/%u/stat", tgid);
     int fd = ::open(path, O_RDONLY);
-    if (fd < 0) return nullptr;
+    if (fd < 0) { TLOG("SYNTH tgid=%u FAILED (no /proc)", tgid); return nullptr; }
     char buf[512];
     ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
     ::close(fd);
-    if (n <= 0) return nullptr;
+    if (n <= 0) { TLOG("SYNTH tgid=%u FAILED (read)", tgid); return nullptr; }
     buf[n] = 0;
     char *lp = std::strchr(buf, '(');
     char *rp = std::strrchr(buf, ')');
-    if (!lp || !rp || lp >= rp) return nullptr;
+    if (!lp || !rp || lp >= rp) { TLOG("SYNTH tgid=%u FAILED (parse)", tgid); return nullptr; }
     char state; unsigned ppid = 0, pgid = 0;
-    if (std::sscanf(rp + 1, " %c %u %u", &state, &ppid, &pgid) != 3) return nullptr;
+    if (std::sscanf(rp + 1, " %c %u %u", &state, &ppid, &pgid) != 3) { TLOG("SYNTH tgid=%u FAILED (scan)", tgid); return nullptr; }
 
     auto sn = std::make_shared<ProcNode>();
     double t = now_sec();
@@ -551,6 +652,8 @@ std::shared_ptr<ProcNode> Tracker::synth_node(std::uint32_t tgid, bool supervise
 
     nodes_[sn->uid] = sn;
     pid_to_uid_[tgid] = sn->uid;
+    TLOG("SYNTH-NODE tgid=%u ppid=%u pgid=%u comm='%.16s' exempt=%d sup=%d par=%d",
+         tgid, ppid, pgid, sn->comm, (int)sn->exempt, (int)sn->supervised, (int)(bool)par);
     return sn;
 }
 
@@ -567,15 +670,26 @@ std::shared_ptr<ProcNode> Tracker::ensure_node(const edr_event &e) {
     if (sn->exempt) kernel_exempt(sn->tgid, true);
     double t = ns_to_sec(e.ts_ns);
     sn->created_ts = t; sn->last_ev_ts = t; sn->last_score_ts = t;
+    if (supervised_roots_.count(e.ppid) || supervised_roots_.count(e.tgid))
+        sn->supervised = true;
     auto par = lookup_by_pid(e.ppid);
+    bool par_found = (bool)par;
+    bool synthed = false;
     if (par) {
         sn->parent = par; par->children.push_back(sn);
         if (par->supervised || supervised_roots_.count(par->tgid)) sn->supervised = true;
     }
-    else roots_.push_back(sn);
-    if (supervised_roots_.count(e.tgid)) sn->supervised = true;
+    else {
+        auto pn = synth_node(e.ppid, supervised_roots_.count(e.ppid) > 0);
+        if (pn) { sn->parent = pn; pn->children.push_back(sn); if (pn->supervised) sn->supervised = true; synthed = true; }
+        else roots_.push_back(sn);
+    }
     nodes_[sn->uid] = sn;
     pid_to_uid_[e.tgid] = sn->uid;
+    TLOG("ENSURE-NODE ev=%s pid=%u tgid=%u ppid=%u pgid=%u comm='%.16s' exempt=%d sup=%d par=%d synth=%d root=%d",
+         evname(e.ev_type), e.pid, e.tgid, e.ppid, e.pgid, e.comm,
+         (int)sn->exempt, (int)sn->supervised, (int)par_found, (int)synthed,
+         (int)(!par_found && !synthed));
     return sn;
 }
 
@@ -685,6 +799,10 @@ std::string Tracker::compute_origin(const std::shared_ptr<ProcNode> &n) const {
 }
 
 void Tracker::enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::string &action, bool burst) {
+    TLOG("ENQUEUE-PROMPT tgid=%u pid=%u pgid=%u comm='%.16s' risk=%.3f exempt=%d sup=%d burst=%d cached_hash=%d cached_path=%d",
+         n->tgid, n->pid, n->pgid, n->comm, n->risk_pct, (int)n->exempt,
+         (int)node_is_supervised(n), (int)burst,
+         (int)!n->cached_hash.empty(), (int)!n->cached_path.empty());
     if (rep_ && n->cached_hash.empty()) {
         auto hit = tgid_hash_.find(n->tgid);
         if (hit != tgid_hash_.end() && !hit->second.empty()) {
@@ -696,9 +814,9 @@ void Tracker::enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::stri
                 n->cached_hash = h;
                 tgid_hash_[n->tgid] = h;
             }
+            TLOG("ENQUEUE-PROMPT late hash_of_pid(%u) -> %d", n->tgid, (int)ok);
         }
     }
-
     PromptReq r;
     r.uid = n->uid; r.pid = n->pid; r.pgid = n->pgid;
     r.comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
@@ -823,6 +941,7 @@ void Tracker::unblock_hash_live(const std::string &hash) {
 }
 
 void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char decision) {
+    TLOG("RESOLVE uid=%s pgid=%u decision=%c", uid.c_str(), pgid, decision);
     if (decision == 'b') {
         std::string comm; std::uint32_t tgid = 0;
         {
@@ -850,10 +969,12 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
     if (decision == 'd' || decision == 'l') {
         std::uint8_t kind = (decision == 'd') ? REP_BLACKLIST : REP_WHITELIST;
         std::string comm, hash, path; std::uint32_t tgid = 0;
+        bool node_found = false;
         {
             std::unique_lock<std::shared_mutex> lk(g_lock_);
             auto it = nodes_.find(uid);
             if (it != nodes_.end() && it->second) {
+                node_found = true;
                 auto &n = it->second;
                 comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
                 tgid = n->tgid;
@@ -861,21 +982,32 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
                 n->prompt_pending = false;
                 hash = n->cached_hash;
                 path = n->cached_path;
-                if (hash.empty()) {
-                    auto hit = tgid_hash_.find(tgid);
-                    if (hit != tgid_hash_.end()) hash = hit->second;
-                }
             }
+            if (hash.empty()) {
+                auto hit = tgid_hash_.find(tgid);
+                if (hit != tgid_hash_.end()) hash = hit->second;
+            }
+            if (path.empty()) {
+                auto pit = tgid_path_.find(tgid);
+                if (pit != tgid_path_.end()) path = pit->second;
+            }
+        }
+        TLOG("RESOLVE-REP node_found=%d tgid=%u node_hash=%d map_hash=%d map_path='%s'",
+             (int)node_found, tgid, (int)!hash.empty(),
+             (int)(tgid_hash_.find(tgid) != tgid_hash_.end()),
+             path.empty() ? "(none)" : path.c_str());
+        if (hash.empty() && !path.empty()) {
+            bool ok = false;
+            hash = Reputation::hash_of_file(path, ok);
+            if (!ok) hash.clear();
+            TLOG("RESOLVE-REP hash_of_file -> %d", (int)ok);
         }
         if (path.empty() && rep_) path = rep_->resolve_exe(tgid);
         if (hash.empty()) {
             bool ok = false;
             hash = Reputation::hash_of_pid(tgid, ok);
-            if (!ok) {
-                hash.clear();
-                if (!path.empty()) hash = Reputation::hash_of_file(path, ok);
-                if (!ok) hash.clear();
-            }
+            if (!ok) hash.clear();
+            TLOG("RESOLVE-REP hash_of_pid(%u) -> %d", tgid, (int)ok);
         }
         if (comm.empty() && !path.empty()) {
             std::size_t sl = path.find_last_of('/');
@@ -884,6 +1016,8 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
         bool ok = false;
         if (rep_ && !hash.empty())
             ok = rep_->add(kind, hash, comm, path);
+        TLOG("RESOLVE-REP final hash=%d add_called=%d ok=%d",
+             (int)!hash.empty(), (int)(rep_ && !hash.empty()), (int)ok);
         if (kind == REP_BLACKLIST) {
             {
                 std::unique_lock<std::shared_mutex> lk(g_lock_);
@@ -1029,6 +1163,8 @@ void Tracker::ingest(const edr_event &e) {
         {
             std::shared_lock<std::shared_mutex> lk(g_lock_);
             auto sn = lookup_by_pid(e.tgid);
+            TLOG("BURST tgid=%u comm='%.16s' node=%d sup=%d",
+                 e.tgid, e.comm, (int)(bool)sn, sn ? (int)node_is_supervised(sn) : -1);
             if (sn && node_is_supervised(sn)) {
                 return;
             }
@@ -1076,8 +1212,17 @@ void Tracker::ingest(const edr_event &e) {
             n = lookup_by_pid(e.tgid);
         }
         if (n && cfg_.prompt_enabled && !n->prompt_pending) {
+            bool is_me = n->exempt || n->tgid == own_pid_ || self_pid(n->pid, n->pgid);
             std::uint32_t pg = n->pgid;
-            if (pg > 1 && pg != own_pgid_) {
+            TLOG("BURST-FREEZE-CHK tgid=%u pg=%u own_pgid=%u is_me=%d pass=%d",
+                 n->tgid, pg, own_pgid_, (int)is_me, (int)(!is_me && pg > 1 && pg != own_pgid_));
+            if (is_me) {
+                disarm_block(n->tgid);
+                std::unique_lock<std::shared_mutex> lk(g_lock_);
+                n->blocked = false;
+                n->exempt = true;
+                kernel_exempt(n->tgid, true);
+            } else if (pg > 1 && pg != own_pgid_) {
                 ::kill(-static_cast<pid_t>(pg), SIGSTOP);
                 std::unique_lock<std::shared_mutex> lk(g_lock_);
                 n->frozen = true; n->prompt_pending = true;
@@ -1112,11 +1257,12 @@ void Tracker::ingest(const edr_event &e) {
         if (n) {
             n->is_dead = true;
             n->died_ts = ns_to_sec(e.ts_ns);
+            n->frozen = false;
+            n->prompt_pending = false;
             auto wit = watchlist_.find(n->uid);
             if (wit != watchlist_.end()) wit->second.is_dead = true;
             if (n->blocked) { n->blocked = false; disarm_block(n->tgid); }
             kernel_exempt(n->tgid, false);
-            tgid_hash_.erase(n->tgid);
             supervised_roots_.erase(n->tgid);
         }
         return;
@@ -1128,36 +1274,31 @@ void Tracker::ingest(const edr_event &e) {
             std::memcpy(n->comm, e.comm, MAX_COMM);
             n->exempt = self_pid(n->pid, n->pgid) || is_exempt_comm(n->comm);
             kernel_exempt(n->tgid, n->exempt);
-            tgid_hash_.erase(n->tgid);
             n->cached_hash.clear();
             n->cached_path.clear();
-
-
-
             if (!n->exempt) {
                 std::string h;
                 bool ok = false;
-
                 std::string kpath(e.data.exec.filename,
                                   ::strnlen(e.data.exec.filename, MAX_PATH_LEN));
                 if (!kpath.empty()) {
                     h = Reputation::hash_of_file(kpath, ok);
                     if (ok) n->cached_path = kpath;
+                    else if (n->cached_path.empty()) n->cached_path = kpath;
                 }
                 if (!ok) {
                     std::string rp = rep_ ? rep_->resolve_exe(n->tgid) : std::string();
                     if (!rp.empty()) {
                         h = Reputation::hash_of_file(rp, ok);
                         if (ok) n->cached_path = rp;
+                        else if (n->cached_path.empty()) n->cached_path = rp;
                     }
                 }
                 if (!ok) {
                     h = Reputation::hash_of_pid(n->tgid, ok);
                 }
-                if (ok && !h.empty()) {
-                    n->cached_hash = h;
-                    tgid_hash_[n->tgid] = h;
-                }
+                if (ok && !h.empty()) n->cached_hash = h;
+                remember_exec(n->tgid, n->cached_path, n->cached_hash);
                 char dbg[400];
                 std::snprintf(dbg, sizeof(dbg),
                     "[DBG] exec pid=%u comm=%s kpath='%s' cached='%s' hash=%s",
@@ -1166,10 +1307,14 @@ void Tracker::ingest(const edr_event &e) {
                     n->cached_path.empty() ? "(none)" : n->cached_path.c_str(),
                     n->cached_hash.empty() ? "FAIL" : "ok");
                 log_alert(dbg);
+                TLOG("EXEC-CAPTURE tgid=%u comm='%.16s' kpath='%s' cached='%s' hash=%d exempt=%d sup=%d",
+                     n->tgid, n->comm,
+                     kpath.empty() ? "(none)" : kpath.c_str(),
+                     n->cached_path.empty() ? "(none)" : n->cached_path.c_str(),
+                     (int)!n->cached_hash.empty(), (int)n->exempt, (int)supervised);
+            } else {
+                TLOG("EXEC-SKIP tgid=%u comm='%.16s' exempt=1 (no hash captured)", n->tgid, n->comm);
             }
-
-
-            
             if (!n->exempt && !supervised && !n->rep_checked) {
                 n->rep_checked = true;
                 std::string hash, path;
@@ -1223,10 +1368,23 @@ void Tracker::ingest(const edr_event &e) {
     }
     double tw = now_sec();
     bool warm = (tw - start_ts_) >= cfg_.warmup_sec;
-    if (!supervised && cfg_.prompt_enabled && warm && !n->prompt_pending
-        && base >= cfg_.prompt_event_floor
-        && n->risk_pct >= cfg_.prompt_threshold) {
+    bool gate_sup   = !supervised;
+    bool gate_en    = cfg_.prompt_enabled;
+    bool gate_warm  = warm;
+    bool gate_pend  = !n->prompt_pending;
+    bool gate_floor = base >= cfg_.prompt_event_floor;
+    bool gate_thr   = n->risk_pct >= cfg_.prompt_threshold;
+    bool gate_self  = !(n->tgid == own_pid_ || self_pid(n->pid, n->pgid));
+    if (gate_thr && gate_floor) {
+        TLOG("PROMPT-GATE ev=%s tgid=%u comm='%.16s' risk=%.3f base=%.2f | sup=%d en=%d warm=%d pend=%d floor=%d thr=%d self=%d",
+             evname(e.ev_type), n->tgid, n->comm, n->risk_pct, base,
+             (int)gate_sup, (int)gate_en, (int)gate_warm, (int)gate_pend,
+             (int)gate_floor, (int)gate_thr, (int)gate_self);
+    }
+    if (gate_sup && gate_en && gate_warm && gate_pend && gate_floor && gate_thr && gate_self) {
         std::uint32_t pg = n->pgid;
+        TLOG("FREEZE-CHK tgid=%u pg=%u own_pgid=%u pass=%d", n->tgid, pg, own_pgid_,
+             (int)(pg > 1 && pg != own_pgid_));
         if (pg > 1 && pg != own_pgid_) {
             ::kill(-static_cast<pid_t>(pg), SIGSTOP);
             n->frozen = true;
@@ -1243,10 +1401,13 @@ void Tracker::ingest(const edr_event &e) {
 void Tracker::mitigate(std::shared_ptr<ProcNode> n) {
     if (!n || n->exempt || n->kill_flagged) return;
     if (node_is_supervised(n)) return;
+    if (self_pid(n->pid, n->pgid)) return;
     std::uint32_t pgid = n->pgid;
     if (pgid <= 1) return;
     if (pgid == own_pgid_) return;
     n->kill_flagged = true;
+    TLOG("MITIGATE tgid=%u pgid=%u comm='%.16s' risk=%.3f auto_kill=%d",
+         n->tgid, pgid, n->comm, n->risk_pct, (int)cfg_.auto_kill_enabled);
     if (cfg_.auto_kill_enabled) {
         if (::kill(-static_cast<pid_t>(pgid), SIGKILL) == 0) {
             kills_.fetch_add(1);
@@ -1302,7 +1463,6 @@ void Tracker::gc_sweep(double now_s) {
             if (pit->second == u) pit = pid_to_uid_.erase(pit);
             else ++pit;
         }
-        tgid_hash_.erase(dt);
         supervised_roots_.erase(dt);
         nodes_.erase(it);
     }
@@ -1453,7 +1613,6 @@ void Tracker::mark_dead(std::uint32_t tgid) {
     if (wit != watchlist_.end()) wit->second.is_dead = true;
     if (n->blocked) { n->blocked = false; disarm_block(n->tgid); }
     kernel_exempt(n->tgid, false);
-    tgid_hash_.erase(n->tgid);
     supervised_roots_.erase(n->tgid);
 }
 

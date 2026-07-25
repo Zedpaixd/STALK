@@ -189,6 +189,7 @@ private:
     std::unordered_map<std::string, std::shared_ptr<ProcNode>> nodes_;
     std::unordered_map<std::uint32_t, std::string> pid_to_uid_;
     std::unordered_map<std::uint32_t, std::string> tgid_hash_;
+    std::unordered_map<std::uint32_t, std::string> tgid_path_;
     std::unordered_set<std::uint32_t> supervised_roots_;
     std::vector<std::shared_ptr<ProcNode>> roots_;
     std::deque<MasqEvent> masq_events_;
@@ -244,6 +245,7 @@ private:
     bool arm_block(std::uint32_t tgid);
     void disarm_block(std::uint32_t tgid);
     void kernel_exempt(std::uint32_t tgid, bool on);
+    void remember_exec(std::uint32_t tgid, const std::string &path, const std::string &hash);
     int reputation_verdict(std::uint32_t tgid, std::string &hash_out, std::string &path_out);
     int syscall_to_evtype(int nr, std::uint64_t a0, std::uint64_t a2) const;
 };
