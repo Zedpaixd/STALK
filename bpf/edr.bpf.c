@@ -10,7 +10,6 @@ char LICENSE[] SEC("license") = "GPL";
 #define PR_SET_NAME 15
 #define AF_INET 2
 #define AF_INET6 10
-
 #ifndef EPERM
 #define EPERM 1
 #endif
@@ -27,14 +26,12 @@ struct {
     __type(value, struct exec_ctx);
 } exec_state SEC(".maps");
 
-struct str_scratch { char buf[MAX_ARG_LEN]; };
-
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, struct str_scratch);
-} str_buf SEC(".maps");
+    __type(value, struct exec_ctx);
+} exec_stage SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -79,9 +76,8 @@ volatile const __u8  deny_connect      = 1;
 volatile const __u8  block_descendants = 1;
 volatile const __u8  emit_deny_events  = 1;
 volatile const __u32 self_tgid         = 0;
-volatile const __u64 pidns_dev = 0;
-volatile const __u64 pidns_ino = 0;
-
+volatile const __u64 pidns_dev         = 0;
+volatile const __u64 pidns_ino         = 0;
 volatile const __u8  burst_enabled     = 1;
 volatile const __u64 burst_ceiling_fp  = 983040;
 volatile const __u32 bw_memfd          = 131072;
@@ -166,19 +162,6 @@ static __always_inline void fill_meta(struct edr_event *e) {
     e->uid = (__u32)bpf_get_current_uid_gid();
     e->ns_inum = rd_nsinum(t);
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
-    if (e->comm[0] == 'e' && e->comm[1] == 'd' && e->comm[2] == 'r' && e->comm[3] == 0) {
-        struct task_struct *rp = BPF_CORE_READ(t, real_parent);
-        __u32 rp_tgid = rp ? BPF_CORE_READ(rp, tgid) : 0;
-        char pcomm[16] = {};
-        if (rp) bpf_probe_read_kernel_str(pcomm, sizeof(pcomm), BPF_CORE_READ(rp, comm));
-        struct task_struct *gp = rp ? BPF_CORE_READ(rp, real_parent) : 0;
-        __u32 gp_tgid = gp ? BPF_CORE_READ(gp, tgid) : 0;
-        char gcomm[16] = {};
-        if (gp) bpf_probe_read_kernel_str(gcomm, sizeof(gcomm), BPF_CORE_READ(gp, comm));
-        bpf_printk("MP pid=%u tgid=%u self=%u", e->pid, e->tgid, self_tgid);
-        bpf_printk("MP par=%u '%s'", rp_tgid, pcomm);
-        bpf_printk("MP gpar=%u '%s'", gp_tgid, gcomm);
-    }
 }
 
 static __always_inline struct edr_event *ev_reserve(__u8 ty) {
@@ -243,14 +226,6 @@ int tp_fork(struct trace_event_raw_sched_process_fork *ctx) {
     e->uid = (__u32)bpf_get_current_uid_gid();
     e->ns_inum = rd_nsinum(t);
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
-
-    if (e->comm[0] == 'e' && e->comm[1] == 'd' && e->comm[2] == 'r' && e->comm[3] == 0) {
-        __u64 pt = bpf_get_current_pid_tgid();
-        bpf_printk("FORK cur_pid=%u cur_tgid=%u", (__u32)pt, (__u32)(pt >> 32));
-        bpf_printk("FORK ctx_parent=%u ctx_child=%u self=%u",
-                   ctx->parent_pid, ctx->child_pid, self_tgid);
-    }
-
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
@@ -279,38 +254,66 @@ static __always_inline void grab_argv(const char *const *argv, char *dst) {
     }
 }
 
+static __always_inline void fill_fid(struct file *f, struct file_id *fid) {
+    if (!f) return;
+    struct inode *node = BPF_CORE_READ(f, f_inode);
+    if (!node) return;
+    fid->ino  = BPF_CORE_READ(node, i_ino);
+    fid->size = (__u64)BPF_CORE_READ(node, i_size);
+    struct super_block *sb = BPF_CORE_READ(node, i_sb);
+    __u32 dev = sb ? BPF_CORE_READ(sb, s_dev) : 0;
+    fid->dev_major = dev >> 20;
+    fid->dev_minor = dev & 0xFFFFF;
+    fid->mtime_ns = 0;
+}
+
 SEC("tracepoint/syscalls/sys_enter_execve")
 int tp_execve(struct trace_event_raw_sys_enter *ctx) {
     __u32 k = 0;
-    struct str_scratch *s = bpf_map_lookup_elem(&str_buf, &k);
-    if (!s) return 0;
-    __builtin_memset(s->buf, 0, MAX_ARG_LEN);
-    grab_argv((const char *const *)ctx->args[1], s->buf);
-    burst_add(bw_exec);
-    struct edr_event *e = ev_reserve(EV_EXEC);
-    if (!e) return 0;
-    fill_meta(e);
-    __builtin_memcpy(e->data.exec.argbuf, s->buf, MAX_ARG_LEN);
-    bpf_probe_read_user_str(e->data.exec.filename, MAX_PATH_LEN,
-                            (const char *)ctx->args[0]);
-    bpf_ringbuf_submit(e, 0);
+    struct exec_ctx *ec = bpf_map_lookup_elem(&exec_stage, &k);
+    if (!ec) return 0;
+    __builtin_memset(ec->args, 0, MAX_ARG_LEN);
+    grab_argv((const char *const *)ctx->args[1], ec->args);
+    __u64 pt = bpf_get_current_pid_tgid();
+    ec->ts_ns = bpf_ktime_get_ns();
+    ec->pid = (__u32)pt;
+    ec->tgid = (__u32)(pt >> 32);
+    bpf_map_update_elem(&exec_state, &pt, ec, BPF_ANY);
     return 0;
 }
 
 SEC("tracepoint/syscalls/sys_enter_execveat")
 int tp_execveat(struct trace_event_raw_sys_enter *ctx) {
     __u32 k = 0;
-    struct str_scratch *s = bpf_map_lookup_elem(&str_buf, &k);
-    if (!s) return 0;
-    __builtin_memset(s->buf, 0, MAX_ARG_LEN);
-    grab_argv((const char *const *)ctx->args[2], s->buf);
+    struct exec_ctx *ec = bpf_map_lookup_elem(&exec_stage, &k);
+    if (!ec) return 0;
+    __builtin_memset(ec->args, 0, MAX_ARG_LEN);
+    grab_argv((const char *const *)ctx->args[2], ec->args);
+    __u64 pt = bpf_get_current_pid_tgid();
+    ec->ts_ns = bpf_ktime_get_ns();
+    ec->pid = (__u32)pt;
+    ec->tgid = (__u32)(pt >> 32);
+    bpf_map_update_elem(&exec_state, &pt, ec, BPF_ANY);
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_process_exec")
+int tp_exec_done(struct trace_event_raw_sched_process_exec *ctx) {
     burst_add(bw_exec);
     struct edr_event *e = ev_reserve(EV_EXEC);
     if (!e) return 0;
     fill_meta(e);
-    __builtin_memcpy(e->data.exec.argbuf, s->buf, MAX_ARG_LEN);
-    bpf_probe_read_user_str(e->data.exec.filename, MAX_PATH_LEN,
-                            (const char *)ctx->args[1]);
+    __u64 pt = bpf_get_current_pid_tgid();
+    struct exec_ctx *ec = bpf_map_lookup_elem(&exec_state, &pt);
+    if (ec) {
+        __builtin_memcpy(e->data.exec.argbuf, ec->args, MAX_ARG_LEN);
+        bpf_map_delete_elem(&exec_state, &pt);
+    }
+    unsigned int off = ctx->__data_loc_filename & 0xFFFF;
+    bpf_probe_read_kernel_str(e->data.exec.filename, MAX_PATH_LEN, (char *)ctx + off);
+    struct task_struct *t = (struct task_struct *)bpf_get_current_task();
+    struct file *f = BPF_CORE_READ(t, mm, exe_file);
+    fill_fid(f, &e->data.exec.fid);
     bpf_ringbuf_submit(e, 0);
     return 0;
 }

@@ -37,6 +37,14 @@ enum edr_deny_klass {
     DK_CONNECT = 5
 };
 
+struct file_id {
+    __u64 ino;
+    __u64 size;
+    __u64 mtime_ns;
+    __u32 dev_major;
+    __u32 dev_minor;
+} __attribute__((aligned(8)));
+
 struct exec_ctx {
     __u64 ts_ns;
     __u32 pid;
@@ -69,7 +77,7 @@ struct edr_event {
     __u32 _pad1;
     char  comm[MAX_COMM];
     union {
-        struct { char argbuf[MAX_ARG_LEN]; char filename[MAX_PATH_LEN]; } exec;
+        struct { char argbuf[MAX_ARG_LEN]; char filename[MAX_PATH_LEN]; struct file_id fid; } exec;
         struct { __u64 addr; __u64 len; __u32 prot; __u32 _p; } mprot;
         struct { __u32 ret_fd; __u32 _p; char name[MAX_NAME]; } memfd;
         struct { char new_name[MAX_COMM]; } rename;
@@ -79,7 +87,7 @@ struct edr_event {
         struct { __u32 daddr; __u16 dport; __u16 _p; __u32 saddr; } net;
         struct { __u8 klass; __u8 _p[7]; } deny;
         struct { __u32 weight_fp; __u32 _p; } burst;
-        __u8  _raw[MAX_ARG_LEN + MAX_PATH_LEN];
+        __u8  _raw[MAX_ARG_LEN + MAX_PATH_LEN + 32];
     } data __attribute__((aligned(8)));
 } __attribute__((aligned(8)));
 

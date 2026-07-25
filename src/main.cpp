@@ -1,4 +1,5 @@
 #include "common.h"
+#include "hasher.h"
 #include "math_engine.h"
 #include "reputation.h"
 #include "tracker.h"
@@ -150,6 +151,13 @@ int main(int argc, char **argv) {
     std::uint32_t opid  = static_cast<std::uint32_t>(getpid());
     std::fprintf(stderr, "[SELF] pid=%u pgid=%u\n", opid, opgid);
     auto tr = std::make_shared<Tracker>(*cfg_opt, opgid, opid, rep);
+    auto hasher = std::make_shared<BinHasher>(2, 8192);
+    tr->attach_hasher(hasher);
+    hasher->set_callback([w = std::weak_ptr<Tracker>(tr)](const FileId &id,
+                                                          const std::string &h,
+                                                          const std::string &p) {
+        if (auto t = w.lock()) t->on_hash_ready(id, h, p);
+    });
     g_tr = tr.get();
     auto sup = std::make_shared<SeccompSupervisor>();
     sup->attach_tracker(tr.get());
@@ -221,6 +229,7 @@ int main(int argc, char **argv) {
     try_attach(sk->progs.lsm_setuid, tr.get(), "lsm/task_fix_setuid");
     try_attach(sk->progs.lsm_ptrace, tr.get(), "lsm/ptrace_access_check");
     try_attach(sk->progs.lsm_connect, tr.get(), "lsm/socket_connect");
+    try_attach(sk->progs.tp_exec_done, tr.get(), "sched_process_exec");
     tr->set_enforcement_fds(bpf_map__fd(sk->maps.blocked_tgids), bpf_map__fd(sk->maps.enforce_on));
     tr->set_burst_fds(bpf_map__fd(sk->maps.burst_epoch), bpf_map__fd(sk->maps.exempt_tgids));
     tr->set_enforcement(cfg_opt->enforce_enabled);
@@ -247,5 +256,6 @@ int main(int argc, char **argv) {
     if (engine.joinable()) engine.join();
     ring_buffer__free(rb);
     edr_bpf__destroy(sk);
+    hasher->stop();
     return 0;
 }

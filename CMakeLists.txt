@@ -35,6 +35,7 @@ add_executable(edr
     src/keymap.cpp
     src/seccomp_filter.cpp
     src/seccomp_supervisor.cpp
+    src/hasher.cpp
 )
 
 target_include_directories(edr PRIVATE

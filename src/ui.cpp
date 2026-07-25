@@ -270,6 +270,8 @@ static Element build_ebpf_modal(const PromptReq &p, const Keymap &km, int width)
     v.push_back(wrap_indent("Process: [" + std::to_string(p.pid) + "] " + p.comm + org,
                             inner, 9, Color::White, true));
     v.push_back(kv_line("Risk:    ", fmt_pct(p.risk), risk_color(p.risk)));
+    if (!p.path.empty())
+        v.push_back(wrap_indent("Binary:  " + p.path, inner, 9, Color::GrayLight, false));
     v.push_back(wrap_indent("Reason:  it tried to " + p.doing, inner, 9, Color::Yellow, false));
     if (p.from_burst)
         v.push_back(text("           kernel already blocked it; your choice overrides") | dim);

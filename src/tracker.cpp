@@ -71,6 +71,80 @@ static const char *evname(std::uint8_t t) {
     return "?";
 }
 
+void Tracker::inherit_identity(std::uint32_t child_tgid, std::uint32_t parent_tgid) {
+    if (child_tgid == 0 || parent_tgid == 0 || child_tgid == parent_tgid) return;
+    auto fit = tgid_fid_.find(parent_tgid);
+    if (fit == tgid_fid_.end() || !fit->second.valid()) return;
+    tgid_fid_[child_tgid] = fit->second;
+    auto pit = tgid_path_.find(parent_tgid);
+    if (pit != tgid_path_.end()) tgid_path_[child_tgid] = pit->second;
+    auto hit = tgid_hash_.find(parent_tgid);
+    if (hit != tgid_hash_.end()) tgid_hash_[child_tgid] = hit->second;
+    TLOG("INHERIT child=%u <- parent=%u fid=%s hash=%d",
+         child_tgid, parent_tgid, fit->second.key().c_str(),
+         (int)(tgid_hash_.find(child_tgid) != tgid_hash_.end()));
+}
+
+void Tracker::prime_identity(const edr_event &e) {
+    if (!hasher_) return;
+    FileId id;
+    id.ino       = e.data.exec.fid.ino;
+    id.size      = e.data.exec.fid.size;
+    id.mtime_ns  = e.data.exec.fid.mtime_ns;
+    id.dev_major = e.data.exec.fid.dev_major;
+    id.dev_minor = e.data.exec.fid.dev_minor;
+    if (!id.valid()) return;
+    std::string kpath(e.data.exec.filename, ::strnlen(e.data.exec.filename, MAX_PATH_LEN));
+    std::string cached;
+    bool have = hasher_->lookup(id, cached);
+    std::string path;
+    int fd = BinHasher::open_verified(e.tgid, id, path);
+    const char *via = "proc";
+    if (fd < 0 && !kpath.empty()) {
+        fd = BinHasher::open_path_verified(kpath, id);
+        if (fd >= 0) { path = kpath; via = "path"; }
+    }
+    if (fd >= 0) {
+        if (have) ::close(fd);
+        else hasher_->submit(fd, id, path);
+    }
+    std::unique_lock<std::shared_mutex> lk(g_lock_);
+    tgid_fid_[e.tgid] = id;
+    if (!path.empty()) tgid_path_[e.tgid] = path;
+    if (!cached.empty()) tgid_hash_[e.tgid] = cached;
+    TLOG("PRIME tgid=%u fid=%s fd=%d via=%s cached=%d path='%s'",
+         e.tgid, id.key().c_str(), fd, via, (int)have,
+         path.empty() ? "(none)" : path.c_str());
+}
+
+void Tracker::on_hash_ready(const FileId &id, const std::string &hash, const std::string &path) {
+    std::vector<std::uint32_t> hits;
+    {
+        std::unique_lock<std::shared_mutex> lk(g_lock_);
+        for (auto &kv : tgid_fid_) {
+            if (kv.second.key() != id.key()) continue;
+            hits.push_back(kv.first);
+            tgid_hash_[kv.first] = hash;
+            if (!path.empty()) tgid_path_[kv.first] = path;
+            auto n = lookup_by_pid(kv.first);
+            if (n) {
+                n->cached_hash = hash;
+                if (!path.empty() && n->cached_path.empty()) n->cached_path = path;
+            }
+        }
+    }
+    if (!rep_) return;
+    if (rep_->is_whitelisted(hash)) {
+        for (auto tg : hits) {
+            std::unique_lock<std::shared_mutex> lk(g_lock_);
+            auto n = lookup_by_pid(tg);
+            if (n && !n->is_dead) { n->exempt = true; n->blocked = false; kernel_exempt(tg, true); }
+        }
+        return;
+    }
+    if (rep_->is_blacklisted(hash)) reblock_from_reputation(hash);
+}
+
 static double now_sec() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
@@ -799,24 +873,55 @@ std::string Tracker::compute_origin(const std::shared_ptr<ProcNode> &n) const {
 }
 
 void Tracker::enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::string &action, bool burst) {
-    TLOG("ENQUEUE-PROMPT tgid=%u pid=%u pgid=%u comm='%.16s' risk=%.3f exempt=%d sup=%d burst=%d cached_hash=%d cached_path=%d",
-         n->tgid, n->pid, n->pgid, n->comm, n->risk_pct, (int)n->exempt,
-         (int)node_is_supervised(n), (int)burst,
-         (int)!n->cached_hash.empty(), (int)!n->cached_path.empty());
-    if (rep_ && n->cached_hash.empty()) {
-        auto hit = tgid_hash_.find(n->tgid);
-        if (hit != tgid_hash_.end() && !hit->second.empty()) {
-            n->cached_hash = hit->second;
-        } else {
-            bool ok = false;
-            std::string h = Reputation::hash_of_pid(n->tgid, ok);
-            if (ok && !h.empty()) {
-                n->cached_hash = h;
-                tgid_hash_[n->tgid] = h;
+    if (!n) return;
+    bool inherited = false;
+    if (!n->fid.valid()) {
+        auto fit = tgid_fid_.find(n->tgid);
+        if (fit != tgid_fid_.end()) n->fid = fit->second;
+    }
+    if (!n->fid.valid()) {
+        auto cur = n->parent.lock();
+        int guard = 0;
+        while (cur && guard++ < 32) {
+            FileId cand;
+            if (cur->fid.valid()) cand = cur->fid;
+            else {
+                auto fit = tgid_fid_.find(cur->tgid);
+                if (fit != tgid_fid_.end()) cand = fit->second;
             }
-            TLOG("ENQUEUE-PROMPT late hash_of_pid(%u) -> %d", n->tgid, (int)ok);
+            if (cand.valid()) {
+                n->fid = cand;
+                inherited = true;
+                if (n->cached_path.empty()) {
+                    if (!cur->cached_path.empty()) n->cached_path = cur->cached_path;
+                    else {
+                        auto pit = tgid_path_.find(cur->tgid);
+                        if (pit != tgid_path_.end()) n->cached_path = pit->second;
+                    }
+                }
+                TLOG("PROMPT-INHERIT tgid=%u <- ancestor tgid=%u fid=%s",
+                     n->tgid, cur->tgid, cand.key().c_str());
+                break;
+            }
+            cur = cur->parent.lock();
         }
     }
+    if (n->cached_hash.empty()) {
+        auto hit = tgid_hash_.find(n->tgid);
+        if (hit != tgid_hash_.end()) n->cached_hash = hit->second;
+        else if (hasher_ && n->fid.valid()) {
+            std::string h;
+            if (hasher_->lookup(n->fid, h)) { n->cached_hash = h; tgid_hash_[n->tgid] = h; }
+        }
+    }
+    if (n->cached_path.empty()) {
+        auto pit = tgid_path_.find(n->tgid);
+        if (pit != tgid_path_.end()) n->cached_path = pit->second;
+    }
+    TLOG("ENQUEUE-PROMPT tgid=%u pid=%u pgid=%u comm='%.16s' risk=%.3f burst=%d fid_valid=%d hash=%d inherited=%d path='%s'",
+         n->tgid, n->pid, n->pgid, n->comm, n->risk_pct, (int)burst,
+         (int)n->fid.valid(), (int)!n->cached_hash.empty(), (int)inherited,
+         n->cached_path.empty() ? "(none)" : n->cached_path.c_str());
     PromptReq r;
     r.uid = n->uid; r.pid = n->pid; r.pgid = n->pgid;
     r.comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
@@ -824,6 +929,9 @@ void Tracker::enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::stri
     r.doing = action;
     r.risk = n->risk_pct;
     r.from_burst = burst;
+    r.hash = n->cached_hash;
+    r.path = n->cached_path;
+    r.identity_ready = !n->cached_hash.empty() || n->fid.valid();
     r.allow_lbl = act_desc(cfg_.allow_action);
     r.deny_lbl = act_desc(cfg_.deny_action);
     r.kill_lbl = act_desc(cfg_.kill_action);
@@ -968,20 +1076,21 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
 
     if (decision == 'd' || decision == 'l') {
         std::uint8_t kind = (decision == 'd') ? REP_BLACKLIST : REP_WHITELIST;
-        std::string comm, hash, path; std::uint32_t tgid = 0;
-        bool node_found = false;
+        std::string comm, hash, path;
+        std::uint32_t tgid = 0;
+        FileId fid;
         {
             std::unique_lock<std::shared_mutex> lk(g_lock_);
             auto it = nodes_.find(uid);
             if (it != nodes_.end() && it->second) {
-                node_found = true;
                 auto &n = it->second;
                 comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
                 tgid = n->tgid;
-                if (pgid == 0) pgid = n->pgid;
-                n->prompt_pending = false;
+                fid = n->fid;
                 hash = n->cached_hash;
                 path = n->cached_path;
+                if (pgid == 0) pgid = n->pgid;
+                n->prompt_pending = false;
             }
             if (hash.empty()) {
                 auto hit = tgid_hash_.find(tgid);
@@ -991,33 +1100,34 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
                 auto pit = tgid_path_.find(tgid);
                 if (pit != tgid_path_.end()) path = pit->second;
             }
+            if (!fid.valid()) {
+                auto fit = tgid_fid_.find(tgid);
+                if (fit != tgid_fid_.end()) fid = fit->second;
+            }
         }
-        TLOG("RESOLVE-REP node_found=%d tgid=%u node_hash=%d map_hash=%d map_path='%s'",
-             (int)node_found, tgid, (int)!hash.empty(),
-             (int)(tgid_hash_.find(tgid) != tgid_hash_.end()),
-             path.empty() ? "(none)" : path.c_str());
+        if (hash.empty() && hasher_ && fid.valid()) {
+            std::string h;
+            if (hasher_->wait_for(fid, h, 3000)) hash = h;
+            TLOG("RESOLVE-REP wait_for(%s) -> %d", fid.key().c_str(), (int)!hash.empty());
+        }
         if (hash.empty() && !path.empty()) {
             bool ok = false;
-            hash = Reputation::hash_of_file(path, ok);
-            if (!ok) hash.clear();
-            TLOG("RESOLVE-REP hash_of_file -> %d", (int)ok);
-        }
-        if (path.empty() && rep_) path = rep_->resolve_exe(tgid);
-        if (hash.empty()) {
-            bool ok = false;
-            hash = Reputation::hash_of_pid(tgid, ok);
-            if (!ok) hash.clear();
-            TLOG("RESOLVE-REP hash_of_pid(%u) -> %d", tgid, (int)ok);
+            std::string h = Reputation::hash_of_file(path, ok);
+            if (ok) hash = h;
+            TLOG("RESOLVE-REP hash_of_file('%s') -> %d", path.c_str(), (int)ok);
         }
         if (comm.empty() && !path.empty()) {
             std::size_t sl = path.find_last_of('/');
             comm = (sl == std::string::npos) ? path : path.substr(sl + 1);
         }
         bool ok = false;
-        if (rep_ && !hash.empty())
+        if (rep_ && !hash.empty()) {
             ok = rep_->add(kind, hash, comm, path);
-        TLOG("RESOLVE-REP final hash=%d add_called=%d ok=%d",
-             (int)!hash.empty(), (int)(rep_ && !hash.empty()), (int)ok);
+            std::unique_lock<std::shared_mutex> lk(g_lock_);
+            tgid_hash_[tgid] = hash;
+        }
+        TLOG("RESOLVE-REP final tgid=%u fid_valid=%d hash=%d ok=%d",
+             tgid, (int)fid.valid(), (int)!hash.empty(), (int)ok);
         if (kind == REP_BLACKLIST) {
             {
                 std::unique_lock<std::shared_mutex> lk(g_lock_);
@@ -1028,7 +1138,7 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
             if (pgid > 1 && pgid != own_pgid_) ::kill(-static_cast<pid_t>(pgid), SIGCONT);
             log_alert(ok
                 ? "[BLACKLIST] " + comm + " hash persisted; blocked & resumed"
-                : "[BLACKLIST] " + comm + " FAILED to persist (no exe hash)");
+                : "[BLACKLIST] " + comm + " FAILED to persist (binary identity unrecoverable)");
         } else {
             {
                 std::unique_lock<std::shared_mutex> lk(g_lock_);
@@ -1042,7 +1152,7 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
             if (pgid > 1 && pgid != own_pgid_) ::kill(-static_cast<pid_t>(pgid), SIGCONT);
             log_alert(ok
                 ? "[WHITELIST+] " + comm + " hash persisted; exempted & resumed"
-                : "[WHITELIST+] " + comm + " FAILED to persist (no exe hash)");
+                : "[WHITELIST+] " + comm + " FAILED to persist (binary identity unrecoverable)");
         }
         return;
     }
@@ -1158,6 +1268,7 @@ void Tracker::log_masquerade(const std::shared_ptr<ProcNode> &n, const char *new
 
 void Tracker::ingest(const edr_event &e) {
     ev_count_.fetch_add(1);
+    if (e.ev_type == EV_EXEC) prime_identity(e);
     if (e.ev_type == EV_BURST_TRIP) {
         burst_trips_.fetch_add(1);
         {
@@ -1252,6 +1363,20 @@ void Tracker::ingest(const edr_event &e) {
     bool prctl_score = false;
     if (e.ev_type == EV_FORK) {
         n = fork_node(e);
+        if (n) {
+            std::uint32_t src = e.ppid;
+            if (tgid_fid_.find(src) == tgid_fid_.end()) {
+                auto par = n->parent.lock();
+                if (par) src = par->tgid;
+            }
+            inherit_identity(n->tgid, src);
+            auto fit = tgid_fid_.find(n->tgid);
+            if (fit != tgid_fid_.end()) n->fid = fit->second;
+            auto hit = tgid_hash_.find(n->tgid);
+            if (hit != tgid_hash_.end()) n->cached_hash = hit->second;
+            auto pit = tgid_path_.find(n->tgid);
+            if (pit != tgid_path_.end()) n->cached_path = pit->second;
+        }
     } else if (e.ev_type == EV_EXIT) {
         n = lookup_by_pid(e.tgid);
         if (n) {
@@ -1276,45 +1401,16 @@ void Tracker::ingest(const edr_event &e) {
             kernel_exempt(n->tgid, n->exempt);
             n->cached_hash.clear();
             n->cached_path.clear();
-            if (!n->exempt) {
-                std::string h;
-                bool ok = false;
-                std::string kpath(e.data.exec.filename,
-                                  ::strnlen(e.data.exec.filename, MAX_PATH_LEN));
-                if (!kpath.empty()) {
-                    h = Reputation::hash_of_file(kpath, ok);
-                    if (ok) n->cached_path = kpath;
-                    else if (n->cached_path.empty()) n->cached_path = kpath;
-                }
-                if (!ok) {
-                    std::string rp = rep_ ? rep_->resolve_exe(n->tgid) : std::string();
-                    if (!rp.empty()) {
-                        h = Reputation::hash_of_file(rp, ok);
-                        if (ok) n->cached_path = rp;
-                        else if (n->cached_path.empty()) n->cached_path = rp;
-                    }
-                }
-                if (!ok) {
-                    h = Reputation::hash_of_pid(n->tgid, ok);
-                }
-                if (ok && !h.empty()) n->cached_hash = h;
-                remember_exec(n->tgid, n->cached_path, n->cached_hash);
-                char dbg[400];
-                std::snprintf(dbg, sizeof(dbg),
-                    "[DBG] exec pid=%u comm=%s kpath='%s' cached='%s' hash=%s",
-                    n->tgid, n->comm,
-                    kpath.empty() ? "(none)" : kpath.c_str(),
-                    n->cached_path.empty() ? "(none)" : n->cached_path.c_str(),
-                    n->cached_hash.empty() ? "FAIL" : "ok");
-                log_alert(dbg);
-                TLOG("EXEC-CAPTURE tgid=%u comm='%.16s' kpath='%s' cached='%s' hash=%d exempt=%d sup=%d",
-                     n->tgid, n->comm,
-                     kpath.empty() ? "(none)" : kpath.c_str(),
-                     n->cached_path.empty() ? "(none)" : n->cached_path.c_str(),
-                     (int)!n->cached_hash.empty(), (int)n->exempt, (int)supervised);
-            } else {
-                TLOG("EXEC-SKIP tgid=%u comm='%.16s' exempt=1 (no hash captured)", n->tgid, n->comm);
-            }
+            auto fit = tgid_fid_.find(n->tgid);
+            if (fit != tgid_fid_.end()) n->fid = fit->second;
+            auto hit = tgid_hash_.find(n->tgid);
+            if (hit != tgid_hash_.end()) n->cached_hash = hit->second;
+            auto pit = tgid_path_.find(n->tgid);
+            if (pit != tgid_path_.end()) n->cached_path = pit->second;
+            TLOG("EXEC-CAPTURE tgid=%u comm='%.16s' fid=%s hash=%d path='%s' exempt=%d sup=%d",
+                 n->tgid, n->comm, n->fid.key().c_str(), (int)!n->cached_hash.empty(),
+                 n->cached_path.empty() ? "(none)" : n->cached_path.c_str(),
+                 (int)n->exempt, (int)supervised);
             if (!n->exempt && !supervised && !n->rep_checked) {
                 n->rep_checked = true;
                 std::string hash, path;
@@ -1585,16 +1681,10 @@ int Tracker::reputation_verdict(std::uint32_t tgid, std::string &hash_out,
                                 std::string &path_out) {
     if (!rep_) return 0;
     auto hit = tgid_hash_.find(tgid);
-    if (hit != tgid_hash_.end()) {
-        hash_out = hit->second;
-    } else {
-        bool ok = false;
-        std::string h = Reputation::hash_of_pid(tgid, ok);
-        if (!ok || h.empty()) return 0;
-        hash_out = h;
-        tgid_hash_[tgid] = h;
-    }
-    path_out = rep_->resolve_exe(tgid);
+    if (hit == tgid_hash_.end() || hit->second.empty()) return 0;
+    hash_out = hit->second;
+    auto pit = tgid_path_.find(tgid);
+    if (pit != tgid_path_.end()) path_out = pit->second;
     if (rep_->is_whitelisted(hash_out)) return -1;
     if (rep_->is_blacklisted(hash_out)) return 1;
     return 0;

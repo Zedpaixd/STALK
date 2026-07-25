@@ -3,6 +3,7 @@
 
 #include "common.h"
 #include "math_engine.h"
+#include "hasher.h"
 #include "reputation.h"
 #include <atomic>
 #include <cstdint>
@@ -49,6 +50,7 @@ struct ProcNode {
     std::vector<std::shared_ptr<ProcNode>> children;
     std::string cached_hash;
     std::string cached_path;
+    FileId fid;
 };
 
 struct SnapNode {
@@ -102,6 +104,9 @@ struct PromptReq {
     std::string   origin;
     std::string   doing;
     double        risk = 0.0;
+    std::string hash;
+    std::string path;
+    bool identity_ready = false;
     std::string   allow_lbl;
     std::string   deny_lbl;
     std::string   kill_lbl;
@@ -139,6 +144,8 @@ class Tracker {
 public:
     Tracker(EngineCfg cfg, std::uint32_t own_pgid, std::uint32_t own_pid,
             std::shared_ptr<Reputation> rep);
+    void attach_hasher(std::shared_ptr<BinHasher> h) { hasher_ = std::move(h); }
+    void on_hash_ready(const FileId &id, const std::string &hash, const std::string &path);
     void seed_from_proc();
     void ingest(const edr_event &e);
     void tick();
@@ -180,6 +187,9 @@ public:
     std::size_t kill_supervised_tree(std::uint32_t root_tgid);
 
 private:
+    std::shared_ptr<BinHasher> hasher_;
+    std::unordered_map<std::uint32_t, FileId> tgid_fid_;
+    void prime_identity(const edr_event &e);
     EngineCfg cfg_;
     std::uint32_t own_pgid_;
     std::uint32_t own_pid_;
@@ -212,7 +222,7 @@ private:
     std::atomic<std::uint64_t> denies_{0};
     std::atomic<std::uint64_t> burst_trips_{0};
     std::atomic<std::uint64_t> rep_blocks_{0};
-
+    void inherit_identity(std::uint32_t child_tgid, std::uint32_t parent_tgid);
     std::string mk_uid(std::uint32_t tgid, std::uint64_t ts_ns) const;
     std::shared_ptr<ProcNode> lookup_by_pid(std::uint32_t tgid);
     std::shared_ptr<ProcNode> ensure_node(const edr_event &e);
