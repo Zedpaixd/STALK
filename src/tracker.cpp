@@ -872,6 +872,69 @@ std::string Tracker::compute_origin(const std::shared_ptr<ProcNode> &n) const {
     return origin;
 }
 
+bool Tracker::session_allowed(const FileId &id) const {
+    if (!id.valid() || session_allow_.empty()) return false;
+    auto it = session_allow_.find(id.key());
+    return it != session_allow_.end() && !it->second.paused;
+}
+
+void Tracker::recompute_exempt(const std::shared_ptr<ProcNode> &n) {
+    if (!n) return;
+    bool ex = self_pid(n->pid, n->pgid) || is_exempt_comm(n->comm) || session_allowed(n->fid);
+    if (!ex && rep_ && !n->cached_hash.empty() && rep_->is_whitelisted(n->cached_hash)) ex = true;
+    n->exempt = ex;
+    kernel_exempt(n->tgid, ex);
+}
+
+void Tracker::apply_session_locked(const std::string &key) {
+    for (auto &kv : nodes_) {
+        auto &m = kv.second;
+        if (!m || m->is_dead) continue;
+        if (!m->fid.valid() || m->fid.key() != key) continue;
+        recompute_exempt(m);
+    }
+}
+
+std::vector<SessionEntry> Tracker::session_list() const {
+    std::shared_lock<std::shared_mutex> lk(g_lock_);
+    std::vector<SessionEntry> out;
+    out.reserve(session_allow_.size());
+    for (auto &kv : session_allow_) out.push_back(kv.second);
+    std::sort(out.begin(), out.end(), [](const SessionEntry &a, const SessionEntry &b) {
+        return a.added_tstr > b.added_tstr;
+    });
+    return out;
+}
+
+bool Tracker::session_set_paused(const std::string &key, bool paused) {
+    std::string name;
+    {
+        std::unique_lock<std::shared_mutex> lk(g_lock_);
+        auto it = session_allow_.find(key);
+        if (it == session_allow_.end()) return false;
+        it->second.paused = paused;
+        name = it->second.name;
+        apply_session_locked(key);
+    }
+    log_alert(std::string("[SESSION] ") + name + (paused ? " paused (now scored again)"
+                                                         : " resumed (trusted again)"));
+    return true;
+}
+
+bool Tracker::session_remove(const std::string &key) {
+    std::string name;
+    {
+        std::unique_lock<std::shared_mutex> lk(g_lock_);
+        auto it = session_allow_.find(key);
+        if (it == session_allow_.end()) return false;
+        name = it->second.name;
+        session_allow_.erase(it);
+        apply_session_locked(key);
+    }
+    log_alert("[SESSION] " + name + " removed (now scored again)");
+    return true;
+}
+
 void Tracker::enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::string &action, bool burst) {
     if (!n) return;
     bool inherited = false;
@@ -905,6 +968,18 @@ void Tracker::enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::stri
             }
             cur = cur->parent.lock();
         }
+    }
+    if (session_allowed(n->fid)) {
+        n->exempt = true;
+        n->frozen = false;
+        n->prompt_pending = false;
+        kernel_exempt(n->tgid, true);
+        disarm_block(n->tgid);
+        if (n->pgid > 1 && n->pgid != own_pgid_)
+            ::kill(-static_cast<pid_t>(n->pgid), SIGCONT);
+        TLOG("ENQUEUE-PROMPT SKIP tgid=%u session-allowed fid=%s",
+             n->tgid, n->fid.key().c_str());
+        return;
     }
     if (n->cached_hash.empty()) {
         auto hit = tgid_hash_.find(n->tgid);
@@ -1157,6 +1232,76 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
         return;
     }
 
+    if (decision == 'w') {
+        std::string comm, path;
+        std::uint32_t tgid = 0;
+        FileId fid;
+        std::size_t affected = 0, binaries = 0;
+        {
+            std::unique_lock<std::shared_mutex> lk(g_lock_);
+            auto it = nodes_.find(uid);
+            if (it != nodes_.end() && it->second) {
+                auto &n = it->second;
+                comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
+                tgid = n->tgid;
+                fid = n->fid;
+                path = n->cached_path;
+                if (pgid == 0) pgid = n->pgid;
+            }
+            if (!fid.valid()) {
+                auto f2 = tgid_fid_.find(tgid);
+                if (f2 != tgid_fid_.end()) fid = f2->second;
+            }
+            if (path.empty()) {
+                auto p2 = tgid_path_.find(tgid);
+                if (p2 != tgid_path_.end()) path = p2->second;
+            }
+            if (fid.valid()) {
+                auto sit = session_allow_.find(fid.key());
+                if (sit == session_allow_.end()) {
+                    SessionEntry se;
+                    se.key = fid.key();
+                    se.name = comm;
+                    se.path = path;
+                    se.added_tstr = now_hms_ms();
+                    se.paused = false;
+                    session_allow_[se.key] = se;
+                } else {
+                    sit->second.paused = false;
+                    if (sit->second.path.empty()) sit->second.path = path;
+                }
+            }
+            binaries = session_allow_.size();
+            for (auto &kv : nodes_) {
+                auto &m = kv.second;
+                if (!m || m->is_dead) continue;
+                bool match = fid.valid() && m->fid.valid() && m->fid.key() == fid.key();
+                if (!match && m->tgid != tgid) continue;
+                m->exempt = true;
+                m->blocked = false;
+                m->frozen = false;
+                m->prompt_pending = false;
+                kernel_exempt(m->tgid, true);
+                disarm_block(m->tgid);
+                affected++;
+            }
+        }
+        if (pgid > 1 && pgid != own_pgid_) ::kill(-static_cast<pid_t>(pgid), SIGCONT);
+        TLOG("SESSION-ALLOW tgid=%u fid_valid=%d affected=%zu binaries=%zu",
+             tgid, (int)fid.valid(), affected, binaries);
+        char m[224];
+        if (fid.valid())
+            std::snprintf(m, sizeof(m),
+                "[SESSION-ALLOW] %s trusted until restart (%zu live process(es))",
+                comm.c_str(), affected);
+        else
+            std::snprintf(m, sizeof(m),
+                "[SESSION-ALLOW] %s resumed, but binary identity unknown - only this process is trusted",
+                comm.c_str());
+        log_alert(m);
+        return;
+    }
+
     std::string action; const char *dn;
     switch (decision) {
         case 'y': action = cfg_.allow_action; dn = "ALLOW"; break;
@@ -1377,6 +1522,10 @@ void Tracker::ingest(const edr_event &e) {
             auto pit = tgid_path_.find(n->tgid);
             if (pit != tgid_path_.end()) n->cached_path = pit->second;
         }
+        if (!n->exempt && session_allowed(n->fid)) {
+                n->exempt = true;
+                kernel_exempt(n->tgid, true);
+            }
     } else if (e.ev_type == EV_EXIT) {
         n = lookup_by_pid(e.tgid);
         if (n) {
@@ -1397,16 +1546,18 @@ void Tracker::ingest(const edr_event &e) {
         bool supervised = node_is_supervised(n);
         if (n && e.ev_type == EV_EXEC) {
             std::memcpy(n->comm, e.comm, MAX_COMM);
-            n->exempt = self_pid(n->pid, n->pgid) || is_exempt_comm(n->comm);
-            kernel_exempt(n->tgid, n->exempt);
             n->cached_hash.clear();
             n->cached_path.clear();
+            n->fid = FileId{};
             auto fit = tgid_fid_.find(n->tgid);
             if (fit != tgid_fid_.end()) n->fid = fit->second;
             auto hit = tgid_hash_.find(n->tgid);
             if (hit != tgid_hash_.end()) n->cached_hash = hit->second;
             auto pit = tgid_path_.find(n->tgid);
             if (pit != tgid_path_.end()) n->cached_path = pit->second;
+            n->exempt = self_pid(n->pid, n->pgid) || is_exempt_comm(n->comm)
+                        || session_allowed(n->fid);
+            kernel_exempt(n->tgid, n->exempt);
             TLOG("EXEC-CAPTURE tgid=%u comm='%.16s' fid=%s hash=%d path='%s' exempt=%d sup=%d",
                  n->tgid, n->comm, n->fid.key().c_str(), (int)!n->cached_hash.empty(),
                  n->cached_path.empty() ? "(none)" : n->cached_path.c_str(),

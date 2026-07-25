@@ -13,6 +13,7 @@
 using namespace ftxui;
 
 static std::vector<RepEntry> g_repview;
+static std::vector<SessionEntry> g_sessview;
 
 struct KBRow { const char *label; KmAction action; const char *desc; bool header; };
 
@@ -114,19 +115,26 @@ ftxui::Element build_repman_view(const std::shared_ptr<Tracker> &tr,
     auto rep = tr->reputation();
     if (dirty) {
         g_repview = rep ? rep->list() : std::vector<RepEntry>();
+        g_sessview = tr->session_list();
         dirty = false;
     }
+    int np = (int)g_repview.size();
+    int ns = (int)g_sessview.size();
+    int total = np + ns;
     int inner = width - 6;
     if (inner < 32) inner = 32;
-
-    Elements rows;
-    if (g_repview.empty()) {
-        rows.push_back(text(" (no saved binaries yet — blacklist or whitelist one from a decision modal) ")
-                       | dim | center);
-    } else {
+    if (total > 0) {
         if (sel < 0) sel = 0;
-        if (sel >= (int)g_repview.size()) sel = (int)g_repview.size() - 1;
-        for (int i = 0; i < (int)g_repview.size(); i++) {
+        if (sel >= total) sel = total - 1;
+    } else {
+        sel = 0;
+    }
+    Elements rows;
+    if (np == 0) {
+        rows.push_back(text(" (no saved binaries yet — blacklist or whitelist one from a decision modal) ")
+                       | dim);
+    } else {
+        for (int i = 0; i < np; i++) {
             auto &e = g_repview[i];
             const char *kind = (e.kind == REP_BLACKLIST) ? "BLOCK" : "TRUST";
             const char *st = e.paused ? "PAUSED" : "active";
@@ -145,17 +153,37 @@ ftxui::Element build_repman_view(const std::shared_ptr<Tracker> &tr,
             rows.push_back(row);
         }
     }
-
-    char meta[176];
+    rows.push_back(separator());
+    rows.push_back(text(" SESSION ALLOW — in memory only, cleared on restart ")
+                   | bold | color(Color::Cyan));
+    if (ns == 0) {
+        rows.push_back(text(" (none — press [w] at a decision modal to trust a binary for this session) ")
+                       | dim);
+    } else {
+        for (int i = 0; i < ns; i++) {
+            auto &e = g_sessview[i];
+            int idx = np + i;
+            const char *st = e.paused ? "PAUSED" : "active";
+            std::string head = std::string(" SESSION ") + st + "  ";
+            std::string body = (e.name.empty() ? std::string("?") : e.name)
+                + "  " + e.key
+                + "  " + (e.path.empty() ? std::string("<path?>") : e.path)
+                + "  (added " + e.added_tstr + ")";
+            Color c = e.paused ? Color::GrayDark : Color::CyanLight;
+            int indent = (int)head.size();
+            Element row = uic::wrap_indent(head + body, inner, indent, c, (idx == sel));
+            if (idx == sel) row = row | inverted | focus;
+            rows.push_back(row);
+        }
+    }
+    char meta[240];
     std::snprintf(meta, sizeof(meta),
-        " saved binaries=%zu | sel %d/%zu | [p] pause/resume  [x] remove  [Esc] close ",
-        g_repview.size(), g_repview.empty() ? 0 : sel + 1, g_repview.size());
-
+        " saved=%d | session=%d | sel %d/%d | [p] pause/resume  [x] remove  [Esc] close ",
+        np, ns, total ? sel + 1 : 0, total);
     Element tamper = rep && rep->tamper_flagged()
         ? (text(" ! reputation store checksum MISMATCH — possible tampering ! ")
            | bold | color(Color::Black) | bgcolor(Color::Red))
         : (text("") | dim);
-
     return window(text(" Reputation Manager — saved binary verdicts ") | bold | color(Color::Cyan),
                   vbox({ tamper, text(meta) | dim, separator(),
                          vbox(std::move(rows)) | vscroll_indicator | yframe | flex }))
@@ -166,7 +194,9 @@ bool repman_handle_key(const std::shared_ptr<Tracker> &tr,
                        const ftxui::Event &e, const Keymap &km,
                        int &sel, bool &close_req) {
     close_req = false;
-    int n = (int)g_repview.size();
+    int np = (int)g_repview.size();
+    int ns = (int)g_sessview.size();
+    int n = np + ns;
     if (e == Event::Escape || km.matches(e, KM_REPMAN)) { close_req = true; return true; }
     if (e == Event::ArrowDown || km.matches(e, KM_SEL_DOWN)) { if (n > 0) sel = std::min(n - 1, sel + 1); return true; }
     if (e == Event::ArrowUp || km.matches(e, KM_SEL_UP)) { if (n > 0) sel = std::max(0, sel - 1); return true; }
@@ -179,24 +209,41 @@ bool repman_handle_key(const std::shared_ptr<Tracker> &tr,
         if (m.button == Mouse::WheelDown) { if (n > 0) sel = std::min(n - 1, sel + 1); return true; }
         return true;
     }
-    if (n == 0) return true;
-    auto rep = tr->reputation();
-    if (!rep || sel < 0 || sel >= n) return true;
-    RepEntry cur = g_repview[sel];
-    if (km.matches(e, KM_REP_PAUSE)) {
-        rep->set_paused(cur.hash, cur.kind, !cur.paused);
-        if (cur.kind == REP_BLACKLIST) {
-            if (!cur.paused) tr->unblock_hash_live(cur.hash);
-            else             tr->reblock_from_reputation(cur.hash);
+    if (n == 0 || sel < 0 || sel >= n) return true;
+    if (sel < np) {
+        auto rep = tr->reputation();
+        if (!rep) return true;
+        RepEntry cur = g_repview[sel];
+        if (km.matches(e, KM_REP_PAUSE)) {
+            rep->set_paused(cur.hash, cur.kind, !cur.paused);
+            if (cur.kind == REP_BLACKLIST) {
+                if (!cur.paused) tr->unblock_hash_live(cur.hash);
+                else             tr->reblock_from_reputation(cur.hash);
+            }
+            g_repview = rep->list();
+            return true;
         }
-        g_repview = rep->list();
+        if (km.matches(e, KM_REP_REMOVE)) {
+            rep->remove(cur.hash, cur.kind);
+            if (cur.kind == REP_BLACKLIST) tr->unblock_hash_live(cur.hash);
+            g_repview = rep->list();
+            np = (int)g_repview.size();
+            if (sel >= np + ns) sel = std::max(0, np + ns - 1);
+            return true;
+        }
+        return true;
+    }
+    SessionEntry cur = g_sessview[sel - np];
+    if (km.matches(e, KM_REP_PAUSE)) {
+        tr->session_set_paused(cur.key, !cur.paused);
+        g_sessview = tr->session_list();
         return true;
     }
     if (km.matches(e, KM_REP_REMOVE)) {
-        rep->remove(cur.hash, cur.kind);
-        if (cur.kind == REP_BLACKLIST) tr->unblock_hash_live(cur.hash);
-        g_repview = rep->list();
-        if (sel >= (int)g_repview.size()) sel = std::max(0, (int)g_repview.size() - 1);
+        tr->session_remove(cur.key);
+        g_sessview = tr->session_list();
+        ns = (int)g_sessview.size();
+        if (sel >= np + ns) sel = std::max(0, np + ns - 1);
         return true;
     }
     return true;

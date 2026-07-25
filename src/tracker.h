@@ -140,10 +140,21 @@ struct RiskPrediction {
     std::string parent_comm;
 };
 
+struct SessionEntry {
+    std::string key;
+    std::string name;
+    std::string path;
+    std::string added_tstr;
+    bool paused = false;
+};
+
 class Tracker {
 public:
     Tracker(EngineCfg cfg, std::uint32_t own_pgid, std::uint32_t own_pid,
             std::shared_ptr<Reputation> rep);
+    std::vector<SessionEntry> session_list() const;
+    bool session_set_paused(const std::string &key, bool paused);
+    bool session_remove(const std::string &key);
     void attach_hasher(std::shared_ptr<BinHasher> h) { hasher_ = std::move(h); }
     void on_hash_ready(const FileId &id, const std::string &hash, const std::string &path);
     void seed_from_proc();
@@ -187,6 +198,10 @@ public:
     std::size_t kill_supervised_tree(std::uint32_t root_tgid);
 
 private:
+    std::unordered_map<std::string, SessionEntry> session_allow_;
+    bool session_allowed(const FileId &id) const;
+    void recompute_exempt(const std::shared_ptr<ProcNode> &n);
+    void apply_session_locked(const std::string &key);
     std::shared_ptr<BinHasher> hasher_;
     std::unordered_map<std::uint32_t, FileId> tgid_fid_;
     void prime_identity(const edr_event &e);

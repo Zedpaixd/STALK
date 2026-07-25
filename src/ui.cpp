@@ -607,7 +607,7 @@ void Ui::run() {
             else if (km_.matches(e, KM_BLACKLIST)) { dec = 'd'; repman_dirty = true; }
             else if (km_.matches(e, KM_WHITELIST)) { dec = 'l'; repman_dirty = true; }
             else if (km_.matches(e, KM_KILL)) dec = 'k';
-            else if (km_.matches(e, KM_SESSION_WL)) dec = 'w';
+            else if (km_.matches(e, KM_SESSION_WL)) { dec = 'w'; repman_dirty = true; }
             else if (e == Event::Escape) dec = 'x';
             if (dec) { tr_->resolve_prompt(ebpf_active.uid, ebpf_active.pgid, dec); modal = AM_NONE; }
             return true;
